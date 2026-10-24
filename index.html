@@ -105,15 +105,27 @@
   const mitten = {};      // Straßenname -> Mittelpunkt
   let laufweg = null;     // Verbindungslinie der Route
 
+  // Namen vergleichen ohne Gross-/Kleinschreibung, Umlaute und "ss"/"ß"-Unterschiede
+  function norm(t) {
+    return t.toLowerCase()
+      .replace(/ß/g, "ss").replace(/ä/g, "ae").replace(/ö/g, "oe").replace(/ü/g, "ue")
+      .replace(/straße|strasse|str\./g, "str")
+      .replace(/[^a-z0-9]/g, "");
+  }
+  function findeStrasse(osmName) {
+    const n = norm(osmName);
+    return strassen.find(s => norm(s) === n) || null;
+  }
+
   function farbe(s) {
     return erledigt.includes(s) ? "#4cd08a" : "#ff7a45";
   }
 
   async function ladeStrassen() {
     // Alle Straßen mit einer einzigen Abfrage bei OpenStreetMap holen
-    const namen = strassen.map(s => s.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")).join("|");
+    // Alle benannten Wege im Gebiet holen, der Abgleich der Namen passiert danach im Browser
     const abfrage = `[out:json][timeout:25];`
-      + `way["highway"]["name"~"^(${namen})$"](52.295,8.545,52.330,8.600);`
+      + `way["highway"]["name"](52.298,8.550,52.328,8.595);`
       + `out geom;`;
     const server = [
       "https://overpass-api.de/api/interpreter",
@@ -131,19 +143,26 @@
         } catch (e) { /* naechsten Server probieren */ }
       }
       if (!daten) throw new Error("kein Server erreichbar");
+      const alleNamen = new Set();
       daten.elements.forEach(e => {
-        const name = e.tags.name;
-        if (!strassen.includes(name) || !e.geometry) return;
+        if (!e.geometry || !e.tags || !e.tags.name) return;
+        alleNamen.add(e.tags.name);
+        const name = findeStrasse(e.tags.name);
+        if (!name) return;
         const punkte = e.geometry.map(p => [p.lat, p.lon]);
         const l = L.polyline(punkte, { color: farbe(name), weight: 6, opacity: .9 }).addTo(karte);
         l.bindTooltip(name);
         (linien[name] = linien[name] || []).push(l);
       });
+      window.gefundeneNamen = Array.from(alleNamen).sort();
       berechneMitten();
       zeichneLaufweg();
       const gefunden = Object.keys(linien).length;
       document.getElementById("status").textContent =
-        gefunden + " von " + strassen.length + " Straßen auf der Karte gefunden.";
+        gefunden + " von " + strassen.length + " Straßen auf der Karte gefunden. "
+        + (gefunden < strassen.length
+          ? "Namen in der Gegend: " + window.gefundeneNamen.join(", ")
+          : "");
     } catch (e) {
       document.getElementById("status").textContent =
         "Straßen konnten nicht geladen werden. Internet prüfen und Seite neu laden.";
