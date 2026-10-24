@@ -1,0 +1,249 @@
+<!DOCTYPE html>
+<html lang="de">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Zeitungsroute</title>
+<link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css">
+<script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
+<style>
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  body {
+    font-family: system-ui, sans-serif;
+    background: #0f1420;
+    color: #e8ecf5;
+    padding: 16px;
+    max-width: 700px;
+    margin: 0 auto;
+  }
+  h1 { font-size: 1.5rem; margin: 8px 0 14px; }
+  .bar { height: 14px; background: #1a2133; border-radius: 8px; overflow: hidden; }
+  .fill { height: 100%; width: 0; background: #4cd08a; transition: width .3s; }
+  .count { color: #9aa7c4; margin: 8px 0 14px; }
+  #map { height: 380px; border-radius: 16px; margin-bottom: 8px; }
+  .status { color: #9aa7c4; font-size: .9rem; margin-bottom: 14px; }
+  .next {
+    background: #1f2e4d; border-radius: 14px; padding: 14px 16px;
+    margin-bottom: 14px; font-size: 1.05rem;
+  }
+  .next b { color: #6ea8ff; }
+  .street {
+    display: flex; align-items: center; gap: 14px;
+    background: #1a2133; border-radius: 14px;
+    padding: 16px; margin-bottom: 10px; cursor: pointer;
+    user-select: none;
+  }
+  .street .nr { color: #6ea8ff; font-weight: 700; min-width: 28px; }
+  .street .name { flex: 1; font-size: 1.1rem; }
+  .street .box {
+    width: 28px; height: 28px; border-radius: 8px;
+    border: 2px solid #3a4666; display: grid; place-items: center;
+  }
+  .street.done { opacity: .5; }
+  .street.done .name { text-decoration: line-through; }
+  .street.done .box { background: #4cd08a; border-color: #4cd08a; color: #0f1420; font-weight: 700; }
+  button {
+    width: 100%; padding: 14px; margin: 10px 0 30px;
+    border: none; border-radius: 12px;
+    background: #2a3350; color: #e8ecf5; font-size: 1rem;
+  }
+  .hint { color: #9aa7c4; font-size: .9rem; margin-bottom: 14px; }
+</style>
+</head>
+<body>
+
+<h1>Zeitungsroute Nettelstedt</h1>
+<div class="bar"><div class="fill" id="fill"></div></div>
+<div class="count" id="count"></div>
+
+<div id="map"></div>
+<div class="status" id="status">Karte lädt …</div>
+
+<div class="next" id="next"></div>
+<div class="hint">Tippe eine Straße an, wenn sie fertig ist.</div>
+<div id="list"></div>
+<button onclick="zuruecksetzen()">Neue Runde starten</button>
+
+<script>
+  // Reihenfolge von Zuhause (Westerhang) nach Süden. Zum Ändern einfach Zeilen verschieben.
+  const strassen = [
+    "Westerhang",
+    "Landwehrbrink",
+    "Biekgarten",
+    "Auf dem Kamp",
+    "Am Südhang",
+    "Ammerweg",
+    "Am Rosenbusch",
+    "Amselstraße",
+    "Am Brink",
+    "Hügelweg",
+    "Neuer Friedhofsweg",
+    "Hasenkampstraße",
+    "Am Denkmal",
+    "Am Weiher",
+    "Am Friedenshang",
+    "Vorm Dorfe",
+    "Drukerstraße",
+    "Sperberweg",
+    "Im Eichensiek"
+  ];
+
+  // Kartenmitte: Nettelstedt
+  const MITTE = [52.3115, 8.5700];
+  const KEY = "zeitungsroute-erledigt";
+  let erledigt = JSON.parse(localStorage.getItem(KEY) || "[]");
+
+  // ---------- Karte ----------
+  const karte = L.map("map").setView(MITTE, 16);
+  // Satellitenbild von Esri, ohne Schluessel nutzbar
+  L.tileLayer("https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/{z}/{y}/{x}", {
+    maxZoom: 19,
+    attribution: "Esri, Maxar, Earthstar Geographics"
+  }).addTo(karte);
+
+  const linien = {};      // Straßenname -> Liste von Linien
+  const mitten = {};      // Straßenname -> Mittelpunkt
+  let laufweg = null;     // Verbindungslinie der Route
+
+  function farbe(s) {
+    return erledigt.includes(s) ? "#4cd08a" : "#ff7a45";
+  }
+
+  async function ladeStrassen() {
+    // Alle Straßen mit einer einzigen Abfrage bei OpenStreetMap holen
+    const namen = strassen.map(s => s.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")).join("|");
+    const abfrage = `[out:json][timeout:25];`
+      + `way["highway"]["name"~"^(${namen})$"](52.295,8.545,52.330,8.600);`
+      + `out geom;`;
+    const server = [
+      "https://overpass-api.de/api/interpreter",
+      "https://overpass.kumi.systems/api/interpreter",
+      "https://overpass.private.coffee/api/interpreter"
+    ];
+    try {
+      let daten = null;
+      for (const url of server) {
+        try {
+          const r = await fetch(url + "?data=" + encodeURIComponent(abfrage));
+          if (!r.ok) continue;
+          daten = await r.json();
+          if (daten && daten.elements) break;
+        } catch (e) { /* naechsten Server probieren */ }
+      }
+      if (!daten) throw new Error("kein Server erreichbar");
+      daten.elements.forEach(e => {
+        const name = e.tags.name;
+        if (!strassen.includes(name) || !e.geometry) return;
+        const punkte = e.geometry.map(p => [p.lat, p.lon]);
+        const l = L.polyline(punkte, { color: farbe(name), weight: 6, opacity: .9 }).addTo(karte);
+        l.bindTooltip(name);
+        (linien[name] = linien[name] || []).push(l);
+      });
+      berechneMitten();
+      zeichneLaufweg();
+      const gefunden = Object.keys(linien).length;
+      document.getElementById("status").textContent =
+        gefunden + " von " + strassen.length + " Straßen auf der Karte gefunden.";
+    } catch (e) {
+      document.getElementById("status").textContent =
+        "Straßen konnten nicht geladen werden. Internet prüfen und Seite neu laden.";
+    }
+  }
+
+  function berechneMitten() {
+    Object.keys(linien).forEach(name => {
+      let alle = [];
+      linien[name].forEach(l => alle = alle.concat(l.getLatLngs()));
+      const lat = alle.reduce((a, p) => a + p.lat, 0) / alle.length;
+      const lng = alle.reduce((a, p) => a + p.lng, 0) / alle.length;
+      mitten[name] = [lat, lng];
+    });
+  }
+
+  function zeichneLaufweg() {
+    if (laufweg) karte.removeLayer(laufweg);
+    const punkte = strassen.filter(s => mitten[s]).map(s => mitten[s]);
+    laufweg = L.polyline(punkte, {
+      color: "#6ea8ff", weight: 3, dashArray: "8 8", opacity: .9
+    }).addTo(karte);
+    strassen.forEach((s, i) => {
+      if (!mitten[s]) return;
+      L.marker(mitten[s], {
+        icon: L.divIcon({
+          className: "",
+          html: `<div style="background:#6ea8ff;color:#0f1420;font-weight:700;`
+            + `border-radius:50%;width:24px;height:24px;display:grid;place-items:center;`
+            + `font-size:12px;border:2px solid #0f1420">${i + 1}</div>`,
+          iconSize: [24, 24]
+        })
+      }).addTo(karte);
+    });
+  }
+
+  function faerbeStrassen() {
+    Object.keys(linien).forEach(name => {
+      linien[name].forEach(l => l.setStyle({ color: farbe(name) }));
+    });
+  }
+
+  // ---------- Standort ----------
+  let standortPunkt = null;
+  if ("geolocation" in navigator) {
+    navigator.geolocation.watchPosition(pos => {
+      const p = [pos.coords.latitude, pos.coords.longitude];
+      if (!standortPunkt) {
+        standortPunkt = L.circleMarker(p, {
+          radius: 9, color: "#fff", weight: 3, fillColor: "#2f6bff", fillOpacity: 1
+        }).addTo(karte);
+      } else {
+        standortPunkt.setLatLng(p);
+      }
+    }, () => {}, { enableHighAccuracy: true });
+  }
+
+  // ---------- Liste ----------
+  function zeichne() {
+    const list = document.getElementById("list");
+    list.innerHTML = strassen.map((s, i) => {
+      const fertig = erledigt.includes(s);
+      return `<div class="street ${fertig ? "done" : ""}" onclick="umschalten(${i})">`
+        + `<span class="nr">${i + 1}</span>`
+        + `<span class="name">${s}</span>`
+        + `<span class="box">${fertig ? "✓" : ""}</span></div>`;
+    }).join("");
+
+    const n = erledigt.length;
+    document.getElementById("fill").style.width = (n / strassen.length * 100) + "%";
+    document.getElementById("count").textContent =
+      n + " von " + strassen.length + " Straßen erledigt"
+      + (n === strassen.length ? " – geschafft! 🎉" : "");
+
+    const naechste = strassen.find(s => !erledigt.includes(s));
+    document.getElementById("next").innerHTML = naechste
+      ? `Als Nächstes: <b>${naechste}</b>`
+      : "Alles ausgetragen, gute Arbeit!";
+  }
+
+  function umschalten(i) {
+    const s = strassen[i];
+    erledigt = erledigt.includes(s) ? erledigt.filter(x => x !== s) : [...erledigt, s];
+    localStorage.setItem(KEY, JSON.stringify(erledigt));
+    zeichne();
+    faerbeStrassen();
+    if (mitten[s]) karte.panTo(mitten[s]);
+  }
+
+  function zuruecksetzen() {
+    if (confirm("Alle Haken löschen und neu starten?")) {
+      erledigt = [];
+      localStorage.setItem(KEY, "[]");
+      zeichne();
+      faerbeStrassen();
+    }
+  }
+
+  zeichne();
+  ladeStrassen();
+</script>
+</body>
+</html>
